@@ -131,7 +131,7 @@ type http2Handler struct {
 }
 
 func (h http2Handler) ServeHTTP(w *http2.ResponseWriter, req *http2.ServerRequest) {
-	h.h.ServeHTTP(http2ResponseWriter{w}, &Request{
+	r := &Request{
 		ctx:           req.Context,
 		Proto:         "HTTP/2.0",
 		ProtoMajor:    2,
@@ -147,7 +147,9 @@ func (h http2Handler) ServeHTTP(w *http2.ResponseWriter, req *http2.ServerReques
 		RemoteAddr:    req.RemoteAddr,
 		TLS:           req.TLS,
 		MultipartForm: req.MultipartForm,
-	})
+	}
+	r.ctx = applyServerTraceContext(r.ctx, r.Header)
+	h.h.ServeHTTP(http2ResponseWriter{w}, r)
 }
 
 type http2ResponseWriter struct {
