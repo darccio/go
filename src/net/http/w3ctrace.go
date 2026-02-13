@@ -339,6 +339,8 @@ func applyServerTraceContextContinue(ctx context.Context, traceparent, tracestat
 
 	tc, ok := parseTraceparent(traceparent)
 	if !ok {
+		// Invalid inbound traceparent: start a fresh trace context.
+		// Incoming tracestate is intentionally dropped in this path.
 		return createNewTraceContext(ctx)
 	}
 

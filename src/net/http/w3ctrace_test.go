@@ -829,7 +829,7 @@ func (w *responseWriterBenchmark) Header() Header {
 }
 
 func (*responseWriterBenchmark) Write(b []byte) (int, error) { return len(b), nil }
-func (*responseWriterBenchmark) WriteHeader(int)              {}
+func (*responseWriterBenchmark) WriteHeader(int)             {}
 
 func TestClientTraceContext_Continue_ExistingValidHeader(t *testing.T) {
 	// When valid traceparent already present, should be no-op
@@ -1171,9 +1171,9 @@ func TestTraceWillInject(t *testing.T) {
 	// traceWillInject should return false when injection is a no-op,
 	// so the HTTP/2 path can skip header cloning.
 	tests := []struct {
-		name      string
-		header    string   // Traceparent on req.Header ("" = absent)
-		ctxRaw    string   // raw traceparent in context ("" = no context)
+		name       string
+		header     string // Traceparent on req.Header ("" = absent)
+		ctxRaw     string // raw traceparent in context ("" = no context)
 		wantInject bool
 	}{
 		{
@@ -1276,6 +1276,85 @@ func TestApplyServerTraceContext_ContinueMode(t *testing.T) {
 		0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36}
 	if tc.traceID != expectedTraceID {
 		t.Errorf("trace-id mismatch in continue mode")
+	}
+	if tc.tracestate != "vendor1=value1" {
+		t.Errorf("tracestate mismatch: got %q", tc.tracestate)
+	}
+}
+
+func TestApplyServerTraceContext_ContinueMode_InvalidTraceparentCreatesNew(t *testing.T) {
+	t.Setenv("GODEBUG", "httpw3ctrace=continue")
+
+	headers := make(Header)
+	headers.Set("Traceparent", "invalid-traceparent")
+	headers.Set("Tracestate", "vendor1=value1")
+
+	result := applyServerTraceContext(context.Background(), headers)
+	tc, ok := getTraceContext(result)
+	if !ok {
+		t.Fatal("expected trace context in continue mode")
+	}
+	if isZeroID(tc.traceID[:]) {
+		t.Error("trace-id should not be zero")
+	}
+	if isZeroID(tc.spanID[:]) {
+		t.Error("span-id should not be zero")
+	}
+	if tc.tracestate != "" {
+		t.Errorf("tracestate should be discarded with invalid traceparent, got %q", tc.tracestate)
+	}
+}
+
+func TestApplyServerTraceContext_ContinueMode_InvalidVersionCreatesNew(t *testing.T) {
+	t.Setenv("GODEBUG", "httpw3ctrace=continue")
+
+	headers := make(Header)
+	// Non-hex version means version parsing fails.
+	headers.Set("Traceparent", "zz-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	headers.Set("Tracestate", "vendor1=value1")
+
+	result := applyServerTraceContext(context.Background(), headers)
+	tc, ok := getTraceContext(result)
+	if !ok {
+		t.Fatal("expected trace context in continue mode")
+	}
+	if isZeroID(tc.traceID[:]) {
+		t.Error("trace-id should not be zero")
+	}
+	if isZeroID(tc.spanID[:]) {
+		t.Error("span-id should not be zero")
+	}
+	if tc.tracestate != "" {
+		t.Errorf("tracestate should be discarded with invalid version, got %q", tc.tracestate)
+	}
+}
+
+func TestApplyServerTraceContext_ContinueMode_FutureVersionIsAccepted(t *testing.T) {
+	t.Setenv("GODEBUG", "httpw3ctrace=continue")
+
+	const incoming = "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03-extra"
+
+	headers := make(Header)
+	headers.Set("Traceparent", incoming)
+	headers.Set("Tracestate", "vendor1=value1")
+
+	result := applyServerTraceContext(context.Background(), headers)
+	tc, ok := getTraceContext(result)
+	if !ok {
+		t.Fatal("expected trace context in continue mode")
+	}
+
+	expectedTraceID := [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
+		0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36}
+	if tc.traceID != expectedTraceID {
+		t.Errorf("trace-id mismatch for future version")
+	}
+	expectedParentID := [8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7}
+	if tc.spanID != expectedParentID {
+		t.Errorf("parent-id mismatch for future version")
+	}
+	if tc.traceFlags != 0x03 {
+		t.Errorf("trace-flags mismatch: got %02x, want 03", tc.traceFlags)
 	}
 	if tc.tracestate != "vendor1=value1" {
 		t.Errorf("tracestate mismatch: got %q", tc.tracestate)
@@ -1672,4 +1751,3 @@ func BenchmarkInjectClientTraceContext_Restart(b *testing.B) {
 		injectClientTraceContextWithSpan(req, extra)
 	}
 }
-
