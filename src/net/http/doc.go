@@ -104,5 +104,33 @@ Alternatively, the following GODEBUG settings are currently supported:
 
 The "omithttp2" build tag may be used to disable the HTTP/2 implementation
 contained in the http package.
+
+# W3C Trace Context Propagation
+
+The net/http package supports automatic W3C Trace Context propagation
+(https://www.w3.org/TR/trace-context/) through the httpw3ctrace GODEBUG setting.
+When enabled, the package automatically extracts trace context from incoming
+requests and injects it into outbound requests.
+
+The following modes are supported:
+
+	GODEBUG=httpw3ctrace=ignore      # explicitly disable propagation
+	GODEBUG=httpw3ctrace=continue    # full W3C participation (parse, validate, propagate)
+	GODEBUG=httpw3ctrace=passthrough # opaque forward (no parsing)
+	GODEBUG=httpw3ctrace=restart     # discard inbound, create fresh context
+
+By default (when GODEBUG is unset), the default mode is "passthrough". For ensuring zero overhead,
+set GODEBUG=httpw3ctrace=ignore.
+
+On the server side, trace context is extracted from incoming Traceparent and
+Tracestate headers and stored in the request's Context. On the client side,
+trace context is injected into outbound requests as the final step before dispatch.
+
+The implementation preserves user-set and middleware-set headers: if a valid
+Traceparent header is already present on an outbound request, it will not be
+overridden. This ensures that applications performing manual or library-driven
+propagation (e.g., OpenTelemetry) remain fully in control.
+
+For more details on modes and behavior, see the GODEBUG documentation.
 */
 package http

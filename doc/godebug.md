@@ -190,6 +190,26 @@ Setting `x509sslcertoverrideplatform=0` disables this behavior in favor of using
 the platform certificate store instead of honoring the environment variables. We
 plan to remove this setting in Go 1.31.
 
+Go 1.27 added a new `httpw3ctrace` setting that controls W3C Trace Context propagation
+in the `net/http` package. This setting is opaque and accepts the following values:
+- "ignore": Explicitly disabled — no parsing, no injection, no context storage.
+  User-set headers are not touched.
+- "continue": Full W3C participation — honours inbound `traceparent`/`tracestate`
+  headers, joins existing traces, creates new trace context if absent or invalid,
+  and injects outbound headers (no-op if already present).
+- "passthrough" (or unset or no value): Opaque forward mode — stores raw headers in request
+  context and re-emits unchanged on outbound requests. No parsing, validation, or
+  creation of new IDs. This is the default.
+- "restart": Discards inbound trace context entirely, creates fresh `trace-id` and
+  `parent-id`, and injects on outbound requests.
+
+This setting operates independently of user code and middleware. On the server side,
+trace context is extracted from incoming requests and stored in the request's context.
+On the client side, trace context is injected as the final step before dispatch,
+and existing valid `traceparent` headers set by user code are never overridden.
+
+For more information, see [W3C Trace Context](https://www.w3.org/TR/trace-context/).
+
 ### Go 1.26
 
 Go 1.26 added a new `httpcookiemaxnum` setting that controls the maximum number

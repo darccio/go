@@ -641,7 +641,20 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 	req = setupRewindBody(req)
 
 	if altRT := t.alternateRoundTripper(req); altRT != nil {
-		if resp, err := altRT.RoundTrip(req); err != ErrSkipAltProtocol {
+		// Inject W3C trace context before the alternate (typically cached
+		// HTTP/2) round trip, cloning headers only when needed.
+		// Pre-delete orphaned Tracestate so it cannot leak if
+		// injectClientTraceContext returns early on RNG failure.
+		altReq := req
+		if traceWillInject(req) {
+			altReq = cloneAndInjectTraceContext(req)
+		}
+		if resp, err := altRT.RoundTrip(altReq); err != ErrSkipAltProtocol {
+			if resp != nil && altReq != req {
+				// A cloned request was used for trace injection;
+				// restore resp.Request to the caller's original.
+				resp.Request = origReq
+			}
 			return resp, err
 		}
 		var err error
@@ -720,7 +733,11 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 		var resp *Response
 		if pconn.alt != nil {
 			// HTTP/2 path.
-			resp, err = pconn.alt.RoundTrip(req)
+			if traceWillInject(req) {
+				resp, err = pconn.alt.RoundTrip(cloneAndInjectTraceContext(req))
+			} else {
+				resp, err = pconn.alt.RoundTrip(req)
+			}
 		} else {
 			resp, err = pconn.roundTrip(treq)
 		}
@@ -3026,6 +3043,21 @@ func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err err
 		!isProtocolSwitchHeader(req.Header) {
 		req.extraHeaders().Set("Connection", "close")
 	}
+
+	// Inject W3C trace context headers as the final step before dispatch.
+	// Write to extraHeaders so the caller's original Request is not mutated.
+	//
+	// If req.Header carries an orphaned Tracestate (without Traceparent),
+	// clone the header so the stale state can be removed: extraHeaders
+	// alone cannot suppress keys from req.Header during serialization.
+	if traceWillInject(req.Request) && req.Request.Header.has("Tracestate") {
+		clone := new(Request)
+		*clone = *req.Request
+		clone.Header = req.Request.Header.Clone()
+		clone.Header.Del("Tracestate")
+		req.Request = clone
+	}
+	injectClientTraceContext(req.Request, req.extraHeaders())
 
 	gone := make(chan struct{})
 	defer close(gone)
