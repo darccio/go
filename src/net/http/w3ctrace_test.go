@@ -522,6 +522,12 @@ func TestServerTraceContext_Continue_WithValidHeader(t *testing.T) {
 	if tc.tracestate != "vendor1=value1" {
 		t.Errorf("tracestate mismatch: got %q, want %q", tc.tracestate, "vendor1=value1")
 	}
+
+	// Span-id came from a valid inbound header, so it must be marked inbound
+	// (outbound injection preserves it when no local span is registered).
+	if !tc.inbound {
+		t.Error("inbound flag should be true for a valid inbound traceparent")
+	}
 }
 
 func TestServerTraceContext_Continue_WithoutHeader(t *testing.T) {
@@ -540,6 +546,11 @@ func TestServerTraceContext_Continue_WithoutHeader(t *testing.T) {
 	if tc.traceFlags != 0x01 {
 		t.Errorf("trace-flags should be 0x01 (sampled), got %02x", tc.traceFlags)
 	}
+	// A freshly created context (no inbound header) is not inbound: its span-id
+	// is locally minted, so outbound injection is free to replace it.
+	if tc.inbound {
+		t.Error("inbound flag should be false when no inbound traceparent was present")
+	}
 }
 
 func TestServerTraceContext_Continue_InvalidHeader(t *testing.T) {
@@ -557,6 +568,10 @@ func TestServerTraceContext_Continue_InvalidHeader(t *testing.T) {
 	}
 	if tc.tracestate != "" {
 		t.Errorf("tracestate should be discarded, got %q", tc.tracestate)
+	}
+	// Invalid inbound header falls back to a fresh context: not inbound.
+	if tc.inbound {
+		t.Error("inbound flag should be false when the inbound traceparent was invalid")
 	}
 }
 
@@ -882,7 +897,10 @@ func TestClientTraceContext_ExistingInvalidHeader_NoOp(t *testing.T) {
 }
 
 func TestClientTraceContext_Continue_FromContext(t *testing.T) {
-	// Should inject headers from context with updated span-id
+	// A context parsed from a valid inbound traceparent (inbound=true) with no
+	// registered span must PRESERVE the inbound parent-id on the outbound
+	// request, rather than minting a random ("phantom") span-id. This keeps a
+	// service that does not report a span linked to the real upstream span.
 	req := newTestRequest(t)
 
 	originalTraceID := [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
@@ -894,6 +912,7 @@ func TestClientTraceContext_Continue_FromContext(t *testing.T) {
 		spanID:     originalSpanID,
 		traceFlags: 0x01,
 		tracestate: "vendor1=value1",
+		inbound:    true,
 	}
 	ctx := setTraceContext(context.Background(), tc)
 	req = req.WithContext(ctx)
@@ -918,14 +937,11 @@ func TestClientTraceContext_Continue_FromContext(t *testing.T) {
 		t.Error("trace-id was not preserved")
 	}
 
-	// Should have NEW span-id (not the original)
-	if injectedTC.spanID == originalSpanID {
-		t.Error("span-id was not updated for outbound request")
-	}
-
-	// Should be non-zero
-	if isZeroID(injectedTC.spanID[:]) {
-		t.Error("new span-id is zero")
+	// Should PRESERVE the inbound span-id (no phantom mint) since no
+	// observability library registered a span via WithTraceInfo.
+	if injectedTC.spanID != originalSpanID {
+		t.Errorf("inbound span-id should be preserved, got %x want %x",
+			injectedTC.spanID, originalSpanID)
 	}
 
 	// Should preserve tracestate
@@ -969,6 +985,166 @@ func TestClientTraceContext_Continue_NoContext(t *testing.T) {
 	// Should be sampled
 	if tc.traceFlags != 0x01 {
 		t.Errorf("trace-flags should be 0x01, got %02x", tc.traceFlags)
+	}
+}
+
+func TestClientTraceContext_Continue_TraceInfoUpdatesSpanID(t *testing.T) {
+	// When an observability library registers a span via WithTraceInfo, its
+	// span-id becomes the outbound parent-id even for an inbound context —
+	// the library's real span replaces the preserved upstream parent-id.
+	req := newTestRequest(t)
+
+	originalTraceID := [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
+		0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36}
+	originalSpanID := [8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7}
+	tc := traceContext{traceID: originalTraceID, spanID: originalSpanID, traceFlags: 0x01, inbound: true}
+	ctx := WithTraceInfo(setTraceContext(context.Background(), tc), TraceInfo{SpanID: 0x1122334455667788, Sampled: true})
+	req = req.WithContext(ctx)
+
+	extra := make(Header)
+	injectClientTraceContextWithSpan(req, extra)
+
+	injectedTC, ok := parseTraceparent(extra.Get("Traceparent"))
+	if !ok {
+		t.Fatalf("injected traceparent is invalid: %q", extra.Get("Traceparent"))
+	}
+	if injectedTC.traceID != originalTraceID {
+		t.Error("trace-id was not preserved")
+	}
+	wantSpanID := [8]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	if injectedTC.spanID != wantSpanID {
+		t.Errorf("span-id should be the TraceInfo span-id, got %x want %x", injectedTC.spanID, wantSpanID)
+	}
+}
+
+func TestClientTraceContext_Continue_TraceInfoUnsampledClearsFlag(t *testing.T) {
+	// TraceInfo.Sampled reflects the local recording decision and overrides
+	// the upstream sampled flag on the outbound traceparent.
+	req := newTestRequest(t)
+	tc := traceContext{
+		traceID:    [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36},
+		spanID:     [8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7},
+		traceFlags: 0x01, // upstream sampled
+		inbound:    true,
+	}
+	ctx := WithTraceInfo(setTraceContext(context.Background(), tc), TraceInfo{SpanID: 0x1122334455667788, Sampled: false})
+	req = req.WithContext(ctx)
+
+	extra := make(Header)
+	injectClientTraceContextWithSpan(req, extra)
+	injectedTC, _ := parseTraceparent(extra.Get("Traceparent"))
+	if injectedTC.traceFlags&0x01 != 0 {
+		t.Errorf("sampled flag should be cleared by local decision, got flags %02x", injectedTC.traceFlags)
+	}
+}
+
+func TestClientTraceContext_Continue_VendorEntryMergedNewestFirst(t *testing.T) {
+	// A TraceInfo vendor entry is prepended to the inbound tracestate
+	// (newest-first) so the library's span identity is carried in tracestate.
+	req := newTestRequest(t)
+	tc := traceContext{
+		traceID:    [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36},
+		spanID:     [8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7},
+		traceFlags: 0x01,
+		tracestate: "vendor1=value1",
+		inbound:    true,
+	}
+	ctx := WithTraceInfo(setTraceContext(context.Background(), tc), TraceInfo{
+		SpanID:          0x1122334455667788,
+		Sampled:         true,
+		TraceStateEntry: "dd=s:1122334455667788",
+	})
+	req = req.WithContext(ctx)
+
+	extra := make(Header)
+	injectClientTraceContextWithSpan(req, extra)
+
+	want := "dd=s:1122334455667788,vendor1=value1"
+	if got := extra.Get("Tracestate"); got != want {
+		t.Errorf("tracestate merge: got %q want %q", got, want)
+	}
+}
+
+func TestClientTraceContext_Continue_VendorEntryDedupesSameKey(t *testing.T) {
+	// If the inbound tracestate already carries the library's vendor key, the
+	// stale member is dropped so the fresh value wins with no duplicate key.
+	req := newTestRequest(t)
+	tc := traceContext{
+		traceID:    [16]byte{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36},
+		spanID:     [8]byte{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7},
+		traceFlags: 0x01,
+		tracestate: "dd=s:old,foo=bar",
+		inbound:    true,
+	}
+	ctx := WithTraceInfo(setTraceContext(context.Background(), tc), TraceInfo{
+		SpanID:          0x1122334455667788,
+		Sampled:         true,
+		TraceStateEntry: "dd=s:new",
+	})
+	req = req.WithContext(ctx)
+
+	extra := make(Header)
+	injectClientTraceContextWithSpan(req, extra)
+
+	want := "dd=s:new,foo=bar"
+	if got := extra.Get("Tracestate"); got != want {
+		t.Errorf("tracestate dedup: got %q want %q", got, want)
+	}
+}
+
+func TestClientTraceContext_Restart_InjectsVendorEntryDropsPrior(t *testing.T) {
+	// Restart shape: the server-side createNewTraceContext already dropped the
+	// prior tracestate, so injection with a TraceInfo vendor entry emits only
+	// the library's own entry (Gap 4: restart vendor-key injection).
+	req := newTestRequest(t)
+	ctx := createNewTraceContext(context.Background()) // fresh: no tracestate, inbound=false
+	ctx = WithTraceInfo(ctx, TraceInfo{
+		SpanID:          0x1122334455667788,
+		Sampled:         true,
+		TraceStateEntry: "dd=s:1122334455667788",
+	})
+	req = req.WithContext(ctx)
+
+	extra := make(Header)
+	injectClientTraceContextWithSpan(req, extra)
+
+	if got := extra.Get("Tracestate"); got != "dd=s:1122334455667788" {
+		t.Errorf("restart tracestate: got %q want only the vendor entry", got)
+	}
+	injectedTC, ok := parseTraceparent(extra.Get("Traceparent"))
+	if !ok {
+		t.Fatalf("injected traceparent invalid: %q", extra.Get("Traceparent"))
+	}
+	if wantSpanID := ([8]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}); injectedTC.spanID != wantSpanID {
+		t.Errorf("restart span-id: got %x want %x", injectedTC.spanID, wantSpanID)
+	}
+}
+
+func TestMergeTracestate(t *testing.T) {
+	long := strings.Repeat("k", 300)
+	tests := []struct {
+		name  string
+		entry string
+		prior string
+		want  string
+	}{
+		{"empty entry returns prior", "", "foo=bar", "foo=bar"},
+		{"empty prior returns entry", "dd=s:1", "", "dd=s:1"},
+		{"prepend newest first", "dd=s:1", "foo=bar", "dd=s:1,foo=bar"},
+		{"dedup same key", "dd=s:new", "dd=s:old,foo=bar", "dd=s:new,foo=bar"},
+		{"trim whitespace members", "dd=s:1", "foo=bar, baz=qux", "dd=s:1,foo=bar,baz=qux"},
+		// entry + two ~300-byte members exceeds 512; oldest is dropped, entry kept.
+		{"truncate oldest to fit", "dd=s:1", "a=" + long + ",b=" + long, "dd=s:1,a=" + long},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mergeTracestate(tt.entry, tt.prior); got != tt.want {
+				t.Errorf("mergeTracestate(%q, %q) = %q, want %q", tt.entry, tt.prior, got, tt.want)
+			}
+			if got := mergeTracestate(tt.entry, tt.prior); len(got) > 512 {
+				t.Errorf("mergeTracestate result exceeds 512 bytes: %d", len(got))
+			}
+		})
 	}
 }
 

@@ -7,6 +7,7 @@ package http
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"internal/godebug"
 	"net/textproto"
@@ -87,9 +88,56 @@ type traceContext struct {
 	traceFlags byte     // trace-flags byte
 	tracestate string   // raw validated tracestate, or ""
 	raw        string   // original traceparent for passthrough mode
+	// inbound is true when spanID was parsed from a valid inbound traceparent
+	// (continue mode) rather than minted locally. When true and no TraceInfo is
+	// registered on the outbound request, injection preserves spanID instead of
+	// generating a random one, so a service that does not report a span still
+	// links to the real upstream span rather than emitting a phantom.
+	inbound bool
 }
 
 var traceContextKey = &contextKey{"w3c-trace-context"}
+var traceInfoKey = &contextKey{"w3c-trace-info"}
+
+// TraceInfo holds span identity registered by an observability library.
+// When [WithTraceInfo] is called before an outbound HTTP request, net/http
+// uses the provided span-id and sampling decision in the injected traceparent
+// header instead of generating independent (unreportable) values.
+//
+// Without TraceInfo, net/http generates its own random span-id. That id is
+// never reported to any backend, creating a "phantom span" that breaks trace
+// continuity in observability UIs.
+type TraceInfo struct {
+	// SpanID is the 64-bit identifier of the current span. net/http encodes
+	// it as the parent-id field in the outbound Traceparent header.
+	SpanID uint64
+
+	// Sampled indicates whether this service has decided to sample the trace.
+	// net/http encodes it as bit 0 (the W3C "sampled" flag) of trace-flags,
+	// reflecting the local recording decision rather than mirroring the
+	// upstream's flag.
+	Sampled bool
+
+	// TraceStateEntry is an optional vendor tracestate list-member supplied by
+	// the observability library, in W3C "key=value" form (for example
+	// "dd=s:00f067aa0ba902b7"). When set, net/http prepends it to the outbound
+	// Tracestate header (most-recent entry first), carrying the library's span
+	// identity in tracestate so a backend can reconnect the trace across hops
+	// that do not report a span. The value is treated as opaque: net/http does
+	// not interpret or validate the vendor key; the library owns its
+	// correctness. The zero value (empty string) preserves the prior behavior
+	// of not writing a vendor entry.
+	TraceStateEntry string
+}
+
+// WithTraceInfo returns a copy of ctx carrying ti for use by outbound W3C
+// traceparent injection. Call this after creating a span for the current
+// request and before issuing any outbound HTTP requests from that handler,
+// so that net/http uses the span's identity in the Traceparent header rather
+// than generating its own phantom span-id.
+func WithTraceInfo(ctx context.Context, ti TraceInfo) context.Context {
+	return context.WithValue(ctx, traceInfoKey, ti)
+}
 
 func getTraceContext(ctx context.Context) (traceContext, bool) {
 	tc, ok := ctx.Value(traceContextKey).(traceContext)
@@ -201,6 +249,60 @@ func validateTracestate(h string) (string, bool) {
 		return "", false
 	}
 	return h, true
+}
+
+// mergeTracestate prepends the observability library's vendor entry to the
+// existing tracestate list. Per the W3C spec tracestate is an ordered list
+// with the most recent entry first, so the library entry (representing this
+// hop) goes at the front. If prior already contains a member with the same
+// vendor key, that stale member is dropped so the fresh value wins and no
+// duplicate key is emitted. The result is kept within the 512-byte tracestate
+// limit by dropping the oldest members from the tail; the library entry is
+// never dropped. If the entry alone exceeds the limit, prior is returned
+// unchanged (the vendor entry cannot be represented within the limit).
+func mergeTracestate(entry, prior string) string {
+	entry = textproto.TrimString(entry)
+	if entry == "" {
+		return prior
+	}
+	if prior == "" {
+		if v, ok := validateTracestate(entry); ok {
+			return v
+		}
+		return prior
+	}
+
+	key, _, _ := strings.Cut(entry, "=")
+
+	// Keep prior members whose key differs from the library entry's key.
+	var kept []string
+	for _, m := range strings.Split(prior, ",") {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		mk, _, _ := strings.Cut(m, "=")
+		if mk == key {
+			continue // drop stale duplicate
+		}
+		kept = append(kept, m)
+	}
+
+	// Assemble newest-first, dropping the oldest members until it fits.
+	for {
+		candidate := entry
+		if len(kept) > 0 {
+			candidate = entry + "," + strings.Join(kept, ",")
+		}
+		if v, ok := validateTracestate(candidate); ok {
+			return v
+		}
+		if len(kept) == 0 {
+			// entry alone exceeds the limit; cannot merge.
+			return prior
+		}
+		kept = kept[:len(kept)-1] // drop the oldest member
+	}
 }
 
 // randReadFunc is the function used to generate random bytes.
@@ -343,6 +445,9 @@ func applyServerTraceContextContinue(ctx context.Context, traceparent, tracestat
 		// Incoming tracestate is intentionally dropped in this path.
 		return createNewTraceContext(ctx)
 	}
+	// spanID is the real upstream parent-id, not a locally minted value.
+	// Outbound injection preserves it when no local span is registered.
+	tc.inbound = true
 
 	if tracestate != "" {
 		if validated, ok := validateTracestate(tracestate); ok {
@@ -432,8 +537,9 @@ func injectClientTraceContextWithSpan(req *Request, extra Header) {
 	tc, ok := getTraceContext(req.Context())
 	if !ok || isZeroID(tc.traceID[:]) {
 		// No context, or context came from passthrough mode (which
-		// stores only raw and leaves traceID zeroed). Generate fresh
-		// IDs so we never emit an all-zero trace-id on the wire.
+		// stores only raw and leaves traceID zeroed). Generate a fresh
+		// trace-id so we never emit an all-zero trace-id on the wire.
+		// The span-id is resolved by the switch below.
 		traceID, err := newTraceID()
 		if err != nil {
 			return
@@ -444,11 +550,42 @@ func injectClientTraceContextWithSpan(req *Request, extra Header) {
 		}
 	}
 
-	spanID, err := newSpanID()
-	if err != nil {
-		return
+	switch ti, ok := req.Context().Value(traceInfoKey).(TraceInfo); {
+	case ok && ti.SpanID != 0:
+		// An observability library registered span info via WithTraceInfo:
+		// its span-id becomes the parent-id and its sampling decision sets
+		// trace-flags bit 0 (the local recording decision). If the library
+		// also supplied a vendor tracestate entry, merge it into the outbound
+		// tracestate (newest-first) so its span identity is carried in
+		// tracestate too — letting a backend reconnect the trace across hops
+		// that do not report a span.
+		binary.BigEndian.PutUint64(tc.spanID[:], ti.SpanID)
+		if ti.Sampled {
+			tc.traceFlags |= 0x01
+		} else {
+			tc.traceFlags &^= 0x01
+		}
+		if ti.TraceStateEntry != "" {
+			tc.tracestate = mergeTracestate(ti.TraceStateEntry, tc.tracestate)
+		}
+	case tc.inbound:
+		// No span registered, but spanID was parsed from a valid inbound
+		// traceparent (continue mode). Preserve it rather than generating a
+		// random span-id: a service that does not report a span still links
+		// to the real upstream span instead of emitting a "phantom span" that
+		// is never reported to any backend and breaks trace continuity in
+		// observability UIs. Inbound tracestate is propagated unchanged.
+	default:
+		// True fresh entry: no inbound context and no registered span. A valid
+		// traceparent requires a non-zero parent-id, so generate one. This
+		// span-id is unreported when no observability library is present —
+		// unchanged from prior behavior, and correct for a trace's entry node.
+		spanID, err := newSpanID()
+		if err != nil {
+			return
+		}
+		tc.spanID = spanID
 	}
-	tc.spanID = spanID
 
 	extra.Set("Traceparent", formatTraceparent(tc))
 	if tc.tracestate != "" {
